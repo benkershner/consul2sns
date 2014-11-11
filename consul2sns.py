@@ -1,22 +1,27 @@
 #!/usr/bin/env python
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from sys import stdin
-from json import dumps, loads
 from boto.sns import connect_to_region
-import boto
+from json import dumps, loads
 from re import match
+from sys import stdin, stderr
+import boto
 
 
-# Turn the `consul watch` array into a dictionary
-def array_to_dict(array):
-    return {node["CheckID"]: node for node in array}
+# Turn the `consul watch` array into a dictionary, with 'Node' as the primary
+# key and 'CheckID' as the secondary key.
+def ingest_state(array):
+    state = {}
+    for check in array:
+        state.setdefault(check['Node'], {}).update({check['CheckID']: check})
+    return state
 
 
 def status_delta(then, now):
-    return {checkid: dict(now[checkid].items() +
-                          [("PreviousStatus", then[checkid]["Status"])])
-            for checkid in now
-            if now[checkid]["Status"] != then[checkid]["Status"]}
+    return [dict(now[node][checkid].items() +
+                 [("PreviousStatus", then[node][checkid]["Status"])])
+            for node in now
+            for checkid in now[node]
+            if now[node][checkid]['Status'] != then[node][checkid]['Status']]
 
 
 def get_arn(partial_arn):
@@ -45,8 +50,9 @@ def get_account_id():
         arn = boto.connect_iam().get_user().arn
     except boto.exception.BotoServerError as e:
         # The ARN is in the error message
-        arn = e.error_message.split(' ')[1]
+        arn = e.error_message.split(' ')[-1]
 
+    # The account ID is the 5th field.
     account_id = arn.split(':')[4]
 
     if match(r'^[0-9]{12}$', account_id) is None:
@@ -100,6 +106,12 @@ def get_transitions(args):
 
 # Argparse
 epilog = '''\
+usage:
+  The script will take an input from STDIN and parse it line-by-line. The best
+  way to do this on a *nix-y system is:
+
+  consul watch -type=check cat | ./consul2sns.py -t foo-bar
+
 additional info:
   TOPIC - The topic is the ARN of the SNS topic. If it is an incomplete ARN, the
           script will attempt to build the ARN itself:
@@ -154,16 +166,17 @@ sns = connect_to_region(args.region, **access_args)
 topic = get_arn(args.topic)
 transitions = get_transitions(args)
 
+print >> stderr, "INFO: Republishing to SNS topic:", topic
+print >> stderr, "INFO: Valid state transitions are::", transitions
+
 # Infinite loop
 while True:
     # stdin.readline() blocks until the next newline
-    #now = array_to_dict(loads(stdin.readline()))
-
     line_in = stdin.readline()
     try: 
-        now = array_to_dict(loads(line_in))
+        now = ingest_state(loads(line_in))
     except ValueError as e:
-        print dumps({"unparsable line": line_in})
+        print >> stderr, "WARN: %s" % dumps({"unparsable line": line_in})
         continue
 
     # If this just started, get base-state data
@@ -177,8 +190,9 @@ while True:
         print dumps(delta, indent=4)
 
     # Publish each delta *indiviually*
-    for checkid in delta:
-        if delta[checkid]['State'] in transitions[delta[checkid]['PreviousState']]:
-            sns.publish(topic, dumps(delta[checkid]))
+    for check in delta:
+        if check['Status'] in transitions[check['PreviousStatus']]:
+            sns.publish(topic, dumps(check))
 
     then = now
+
